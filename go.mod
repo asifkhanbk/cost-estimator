@@ -1,4 +1,4 @@
-module github/asifkhanbk/cost-estimator
+module github.com/asifkhanbk/cost-estimator
 
 go 1.24.2
 
