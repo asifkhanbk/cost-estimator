@@ -2,8 +2,6 @@ module github.com/asifkhanbk/cost-estimator
 
 go 1.21
 
-toolchain go1.24.2
-
 require (
 	github.com/olekukonko/tablewriter v1.0.7
 	github.com/spf13/cobra v1.9.1
