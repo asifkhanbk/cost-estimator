@@ -4,227 +4,401 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
-	// "strconv"
 	"strings"
+	"time"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 )
 
-var planFile string
-var providerFilter string
+// --- Pricing mapping ---
 
-var resourcePricingMap = map[string]struct {
-	ServiceName string
-	SKUField    string
-}{
-	"azurerm_linux_virtual_machine":     {"Virtual Machines", "size"},
-	"azurerm_windows_virtual_machine":   {"Virtual Machines", "size"},
-	"azurerm_key_vault":                 {"Key Vault", "sku_name"},
-	"azurerm_private_endpoint":          {"Private Link", ""},
-	"azurerm_storage_account":           {"Storage", "account_tier"},
-	"azurerm_app_service_plan":          {"App Service", "sku_name"},
-	"azurerm_sql_database":              {"SQL Database", "sku_name"},
-	"azurerm_redis_cache":               {"Azure Cache for Redis", "sku_name"},
-	"azurerm_postgresql_flexible_server": {"Azure Database for PostgreSQL", "sku_name"},
-	"azurerm_mysql_flexible_server":     {"Azure Database for MySQL", "sku_name"},
-	"azurerm_kubernetes_cluster":        {"Kubernetes Service", "sku_tier"},
-	"azurerm_network_interface":         {"Network Interface", ""},
-	"azurerm_network_security_group":    {"Network Security Groups", ""},
-	"azurerm_public_ip":                 {"IP Addresses", "sku"},
-	"azurerm_virtual_network":           {"Virtual Network", ""},
-	"azurerm_subnet":                    {"Virtual Network", ""},
-	"azurerm_managed_disk":              {"Storage", "sku_name"},
-	"azurerm_nat_gateway":               {"Virtual Network", "sku_name"},
-	"azurerm_firewall":                  {"Azure Firewall", "sku_name"},
-	"azurerm_application_gateway":       {"Application Gateway", "sku_name"},
-	"azurerm_lb":                        {"Load Balancer", "sku"},
-	"azurerm_data_transfer":             {"Bandwidth", ""},
-	"azurerm_application_insights":      {"Application Insights", "pricingTier"},
-	"azurerm_cosmosdb_account":          {"Azure Cosmos DB", "offer_type"},
+type PricingDefinition struct {
+	ServiceName    string
+	SKUKeys        []string
+	RegionKey      string
+	UsageExtractor func(map[string]interface{}) (float64, string)
+}
+
+var ResourceTypePricingMap = map[string]PricingDefinition{
+	// Add all your Azure resources, example subset:
+	"azurerm_kubernetes_cluster_node_pool": {
+		ServiceName: "Virtual Machines", SKUKeys: []string{"vm_size", "sku"}, RegionKey: "location",
+	},
+	"azurerm_kubernetes_cluster": {
+		ServiceName: "Kubernetes Service", SKUKeys: []string{"sku_tier"}, RegionKey: "location",
+	},
+	"azurerm_linux_virtual_machine": {
+		ServiceName: "Virtual Machines", SKUKeys: []string{"size", "vm_size", "sku"}, RegionKey: "location",
+	},
+	"azurerm_windows_virtual_machine": {
+		ServiceName: "Virtual Machines", SKUKeys: []string{"size", "vm_size", "sku"}, RegionKey: "location",
+	},
+	"azurerm_managed_disk": {
+		ServiceName: "Storage", SKUKeys: []string{"sku_name"}, RegionKey: "location",
+		UsageExtractor: func(vals map[string]interface{}) (float64, string) {
+			sizeGB := 0.0
+			if v, ok := vals["disk_size_gb"]; ok {
+				fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &sizeGB)
+			}
+			return sizeGB, fmt.Sprintf("%.0f GB", sizeGB)
+		},
+	},
+	"azurerm_storage_account": {
+		ServiceName: "Storage", SKUKeys: []string{"account_tier", "sku_name"}, RegionKey: "location",
+	},
+	"azurerm_private_endpoint": {
+		ServiceName: "Private Link", SKUKeys: []string{}, RegionKey: "location",
+	},
+	"azurerm_public_ip": {
+		ServiceName: "IP Addresses", SKUKeys: []string{"sku"}, RegionKey: "location",
+	},
+	"azurerm_virtual_network": {
+		ServiceName: "Virtual Network", SKUKeys: []string{}, RegionKey: "location",
+	},
+	"azurerm_subnet": {
+		ServiceName: "Virtual Network", SKUKeys: []string{}, RegionKey: "location",
+	},
+	// ... extend as you wish!
+	"azurerm_key_vault": {
+		ServiceName: "Key Vault", SKUKeys: []string{"sku_name"}, RegionKey: "location",
+		UsageExtractor: func(vals map[string]interface{}) (float64, string) {
+			// Simulate 20,000 ops for demo
+			simulatedUsage := 20000.0
+			return simulatedUsage, fmt.Sprintf("%.0f operations", simulatedUsage)
+		},
+	},
+}
+
+// --- Resource extraction ---
+
+type Resource struct {
+	Type        string
+	Name        string
+	Region      string
+	Values      map[string]interface{}
+	Address     string
+	RefResource string // If this resource references another resource for region
 }
 
 var estimateCmd = &cobra.Command{
 	Use:   "estimate",
-	Short: "Estimate infra resources from a Terraform plan",
-	Long:  `Parse a Terraform JSON plan and estimate monthly cost using Azure Retail Prices API.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		if planFile == "" {
-			fmt.Println("❌ Please provide a plan file using --plan or -p")
-			return
-		}
-
-		data, err := os.ReadFile(planFile)
-		if err != nil {
-			fmt.Printf("❌ Failed to read file: %v\n", err)
-			return
-		}
-
-		var plan map[string]interface{}
-		if err := json.Unmarshal(data, &plan); err != nil {
-			fmt.Printf("❌ Failed to parse JSON: %v\n", err)
-			return
-		}
-
-		if planned, ok := plan["planned_values"].(map[string]interface{}); ok {
-			if rootModule, ok := planned["root_module"].(map[string]interface{}); ok {
-				resources := extractResources(rootModule)
-				if len(resources) == 0 {
-					fmt.Println("⚠️ No resources found in the plan.")
-					return
-				}
-
-				table := tablewriter.NewWriter(os.Stdout)
-				table.Header([]string{"Type", "Name", "Location", "Raw SKU", "Normalized SKU", "Monthly Cost ($)"})
-
-				for _, res := range resources {
-					typeVal := res["type"].(string)
-					name := res["name"].(string)
-
-					if providerFilter != "" && !strings.HasPrefix(typeVal, providerFilter+"_") {
-						continue
-					}
-
-					val := res["values"].(map[string]interface{})
-					location := fmt.Sprintf("%v", val["location"])
-
-					pricingInfo, ok := resourcePricingMap[typeVal]
-					if !ok {
-						table.Append([]string{typeVal, name, location, "-", "-", "N/A (no pricing map)"})
-						continue
-					}
-
-					rawSKU := ""
-					if pricingInfo.SKUField != "" {
-						rawSKU = fmt.Sprintf("%v", val[pricingInfo.SKUField])
-					}
-					sku := normalizeSku(typeVal, rawSKU)
-
-					price, err := queryAzurePrice(location, sku, pricingInfo.ServiceName, typeVal, val)
-					monthlyCost := "N/A"
-					if err == nil {
-						monthlyCost = fmt.Sprintf("%.2f", price*730)
-					} else if typeVal == "azurerm_virtual_network" || typeVal == "azurerm_subnet" || typeVal == "azurerm_network_security_group" {
-						monthlyCost = "Free"
-					}
-
-					table.Append([]string{typeVal, name, location, rawSKU, sku, monthlyCost})
-				}
-
-				table.Render()
-			}
-		}
-	},
+	Short: "Estimate costs from a Terraform JSON plan",
+	Run:   runEstimate,
 }
 
 func init() {
 	rootCmd.AddCommand(estimateCmd)
-	estimateCmd.Flags().StringVarP(&planFile, "plan", "p", "", "Path to Terraform plan JSON")
-	estimateCmd.Flags().StringVar(&providerFilter, "provider", "", "Filter by provider prefix (e.g., azurerm)")
 }
 
-func extractResources(module map[string]interface{}) []map[string]interface{} {
-	var result []map[string]interface{}
-
-	if resources, ok := module["resources"].([]interface{}); ok {
-		for _, r := range resources {
-			if resMap, ok := r.(map[string]interface{}); ok {
-				typeVal := fmt.Sprintf("%v", resMap["type"])
-				name := fmt.Sprintf("%v", resMap["name"])
-				values, _ := resMap["values"].(map[string]interface{})
-
-				result = append(result, map[string]interface{}{
-					"type":   typeVal,
-					"name":   name,
-					"values": values,
-				})
-			}
-		}
+func runEstimate(cmd *cobra.Command, args []string) {
+	if planFile == "" {
+		fmt.Println("❌ --plan is required")
+		return
 	}
-
-	if children, ok := module["child_modules"].([]interface{}); ok {
-		for _, child := range children {
-			if childMap, ok := child.(map[string]interface{}); ok {
-				childResources := extractResources(childMap)
-				result = append(result, childResources...)
-			}
-		}
-	}
-
-	return result
-}
-
-func normalizeSku(resourceType, raw string) string {
-	if raw == "" {
-		return ""
-	}
-	if strings.HasPrefix(resourceType, "azurerm_linux_virtual_machine") || strings.HasPrefix(resourceType, "azurerm_windows_virtual_machine") {
-		raw = strings.TrimPrefix(raw, "Standard_")
-		return strings.ReplaceAll(raw, "_", " ")
-	}
-	return strings.Title(strings.ReplaceAll(raw, "_", " "))
-}
-
-func queryAzurePrice(region, sku, service, resourceType string, values map[string]interface{}) (float64, error) {
-	filter := fmt.Sprintf("$filter=armRegionName eq '%s' and serviceName eq '%s'", region, service)
-	if sku != "" {
-		filter += fmt.Sprintf(" and skuName eq '%s'", sku)
-	}
-
-	url := fmt.Sprintf("https://prices.azure.com/api/retail/prices?%s", filter)
-
-	resp, err := http.Get(url)
+	data, err := os.ReadFile(planFile)
 	if err != nil {
-		return 0, err
+		fmt.Printf("❌ Failed to read plan: %v\n", err)
+		return
 	}
-	defer resp.Body.Close()
-
-	var data map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return 0, err
+	var plan map[string]interface{}
+	if err := json.Unmarshal(data, &plan); err != nil {
+		fmt.Printf("❌ Failed to parse JSON: %v\n", err)
+		return
 	}
+	variables := extractVariables(plan)
+	addressResourceMap := map[string]*Resource{} // map of resource address to Resource (for ref lookup)
+	rootMod, ok := plan["planned_values"].(map[string]interface{})["root_module"].(map[string]interface{})
+	if !ok {
+		fmt.Println("⚠️ No root_module in plan")
+		return
+	}
+	resources := extractResources(rootMod, addressResourceMap, "")
 
-	if items, ok := data["Items"].([]interface{}); ok {
-		for _, item := range items {
-			if m, ok := item.(map[string]interface{}); ok {
-				meterName := fmt.Sprintf("%v", m["meterName"])
-				unit := fmt.Sprintf("%v", m["unitOfMeasure"])
-				price, _ := m["retailPrice"].(float64)
+	// For nodepool region inheritance: build clusterName -> region map
+	clusterRegions := buildClusterRegionMap(resources)
 
-				switch resourceType {
-				case "azurerm_public_ip":
-					if (strings.Contains(meterName, "Public IP") || strings.Contains(meterName, "IPv4") || strings.Contains(meterName, "IP Address")) && unit == "1 Hour" {
-						return price, nil
-					}
-				case "azurerm_managed_disk":
-					if unit == "1 GB/Month" {
-						size := 128
-						if sz, ok := values["disk_size_gb"].(float64); ok {
-							size = int(sz)
-						}
-						return price * float64(size), nil
-					}
-				case "azurerm_data_transfer":
-					if strings.Contains(meterName, "Data Transfer Out") && unit == "1 GB" {
-						return price * 100, nil
-					}
-				case "azurerm_application_insights":
-					if strings.Contains(meterName, "Data Point") && unit == "1 Million" {
-						return price * 1, nil
-					}
-				case "azurerm_cosmosdb_account":
-					if strings.Contains(meterName, "100 RU/s") && unit == "1 Unit" {
-						return price * 4, nil
-					}
-				default:
-					if price > 0 {
-						return price, nil
-					}
+	// Render
+	table := tablewriter.NewWriter(os.Stdout)
+	table.Header([]string{"Type", "Name", "Region", "SKU / Detail", "Unit", "Usage", "Unit Cost", "Monthly Cost"})
+	var total float64
+
+	for _, r := range resources {
+		def, found := ResourceTypePricingMap[r.Type]
+		if !found {
+			def = PricingDefinition{
+				ServiceName:    guessServiceName(r.Type),
+				SKUKeys:        []string{"sku", "sku_name", "size"},
+				RegionKey:      "location",
+				UsageExtractor: nil,
+			}
+		}
+		region := extractStringWithVars(r.Values, def.RegionKey, variables, addressResourceMap)
+		if region == "" {
+			region = r.Region
+		}
+		// Special: for AKS node pools, if no region, inherit from parent cluster (by cluster_name)
+		if r.Type == "azurerm_kubernetes_cluster_node_pool" && region == "" {
+			clusterName := extractStringWithVars(r.Values, "cluster_name", variables, addressResourceMap)
+			region = clusterRegions[clusterName]
+		}
+		// --- SKU resolution ---
+		sku := ""
+		for _, key := range def.SKUKeys {
+			sku = extractStringWithVars(r.Values, key, variables, addressResourceMap)
+			if sku != "" {
+				break
+			}
+		}
+		quantity := 1.0
+		quantityDesc := "-"
+		if def.UsageExtractor != nil {
+			quantity, quantityDesc = def.UsageExtractor(r.Values)
+			if quantity == 0 {
+				quantity = 1
+			}
+		}
+		unitCost, unit, foundPrice := tryAllPricing(def.ServiceName, region, sku)
+		monthlyCost := 0.0
+		usageText := quantityDesc
+
+		// --- Fallback for private endpoint pricing if API fails ---
+		if r.Type == "azurerm_private_endpoint" && !foundPrice {
+			unitCost = 0.01
+			unit = "1 Hour"
+			monthlyCost = unitCost * 730 * quantity
+			usageText = fmt.Sprintf("%.0f x 730 hours", quantity)
+			foundPrice = true
+		}
+
+		if foundPrice {
+			if strings.Contains(strings.ToLower(unit), "hour") {
+				monthlyCost = unitCost * 730 * quantity
+				if usageText == "-" {
+					usageText = fmt.Sprintf("%.0f x 730 hours", quantity)
+				}
+			} else if strings.Contains(strings.ToLower(unit), "gb") && quantity > 0 {
+				monthlyCost = unitCost * quantity
+			} else if strings.Contains(strings.ToLower(unit), "operation") && quantity > 0 {
+				monthlyCost = unitCost * quantity
+			} else {
+				monthlyCost = unitCost * quantity
+			}
+			total += monthlyCost
+		}
+
+		table.Append([]string{
+			r.Type, r.Name, region, sku, unit, usageText, fmt.Sprintf("%.6f", unitCost), fmt.Sprintf("%.2f", monthlyCost),
+		})
+	}
+	table.Render()
+	fmt.Printf("\n💰 Total Estimated Monthly Cost: $%.2f\n", total)
+}
+
+// --- Variable and reference resolution ---
+
+func extractVariables(plan map[string]interface{}) map[string]string {
+	vars := make(map[string]string)
+	if vmap, ok := plan["variables"].(map[string]interface{}); ok {
+		for k, v := range vmap {
+			if valObj, ok := v.(map[string]interface{}); ok {
+				if val, ok := valObj["value"]; ok {
+					vars[k] = fmt.Sprintf("%v", val)
 				}
 			}
 		}
 	}
+	if vmap, ok := plan["variable_values"].(map[string]interface{}); ok {
+		for k, v := range vmap {
+			vars[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	return vars
+}
 
-	return 0, fmt.Errorf("no price found for region=%s sku=%s", region, sku)
+// Tries to extract a string value, resolving variable or resource field references (deep).
+func extractStringWithVars(m map[string]interface{}, key string, variables map[string]string, resourceMap map[string]*Resource) string {
+	if v, ok := m[key]; ok && v != nil {
+		switch vv := v.(type) {
+		case string:
+			return vv
+		case map[string]interface{}:
+			if refs, ok := vv["references"].([]interface{}); ok && len(refs) > 0 {
+				for _, ref := range refs {
+					if refstr, ok := ref.(string); ok {
+						// Terraform variable
+						if strings.HasPrefix(refstr, "var.") {
+							varkey := strings.TrimPrefix(refstr, "var.")
+							if val, found := variables[varkey]; found {
+								return val
+							}
+						}
+						// Terraform resource reference, e.g., azurerm_kubernetes_cluster.this.location
+						if parts := strings.Split(refstr, "."); len(parts) >= 3 {
+							addr := strings.Join(parts[:3], ".")
+							if res, ok := resourceMap[addr]; ok {
+								field := ""
+								if len(parts) > 3 {
+									field = parts[3]
+								} else if key != "" {
+									field = key
+								}
+								if field != "" {
+									if val, ok := res.Values[field]; ok && val != nil {
+										// Recursively resolve!
+										return extractStringWithVars(res.Values, field, variables, resourceMap)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			// Constant value
+			if cval, ok := vv["constant_value"]; ok {
+				return fmt.Sprintf("%v", cval)
+			}
+		}
+	}
+	return ""
+}
+
+// --- Resource extraction with address map building ---
+
+func extractResources(mod map[string]interface{}, resourceMap map[string]*Resource, modPrefix string) []Resource {
+	var out []Resource
+	if arr, ok := mod["resources"].([]interface{}); ok {
+		for _, x := range arr {
+			m := x.(map[string]interface{})
+			vals := m["values"].(map[string]interface{})
+			r := Resource{
+				Type:    toString(m["type"]),
+				Name:    toString(m["name"]),
+				Region:  "", // Will be resolved
+				Values:  vals,
+				Address: toString(m["address"]),
+			}
+			resourceMap[r.Address] = &r
+			out = append(out, r)
+		}
+	}
+	if children, ok := mod["child_modules"].([]interface{}); ok {
+		for _, c := range children {
+			out = append(out, extractResources(c.(map[string]interface{}), resourceMap, modPrefix)...)
+		}
+	}
+	return out
+}
+
+// --- AKS clusterName -> region map (for nodepools) ---
+
+func buildClusterRegionMap(resources []Resource) map[string]string {
+	clusterRegions := map[string]string{}
+	for _, r := range resources {
+		if r.Type == "azurerm_kubernetes_cluster" {
+			name := extractStringWithVars(r.Values, "name", map[string]string{}, map[string]*Resource{})
+			region := extractStringWithVars(r.Values, "location", map[string]string{}, map[string]*Resource{})
+			if name != "" && region != "" {
+				clusterRegions[name] = region
+			}
+		}
+	}
+	return clusterRegions
+}
+
+// --- Pricing API ---
+
+func tryAllPricing(service, region, sku string) (float64, string, bool) {
+	if service == "" {
+		return 0, "", false
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	base := "https://prices.azure.com/api/retail/prices"
+
+	var filters []string
+	if region != "" && sku != "" {
+		filters = append(filters, fmt.Sprintf("serviceName eq '%s' and armRegionName eq '%s' and (skuName eq '%s' or armSkuName eq '%s')", service, region, sku, sku))
+	}
+	if region != "" {
+		filters = append(filters, fmt.Sprintf("serviceName eq '%s' and armRegionName eq '%s'", service, region))
+	}
+	filters = append(filters, fmt.Sprintf("serviceName eq '%s'", service))
+
+	for _, filter := range filters {
+		urlStr := base + "?$filter=" + url.QueryEscape(filter)
+		for page := 0; urlStr != ""; page++ {
+			resp, err := client.Get(urlStr)
+			if err != nil {
+				break
+			}
+			defer resp.Body.Close()
+
+			var out struct {
+				Items        []struct {
+					RetailPrice   float64 `json:"retailPrice"`
+					UnitOfMeasure string  `json:"unitOfMeasure"`
+					MeterName     string  `json:"meterName"`
+					ArmSkuName    string  `json:"armSkuName"`
+					SkuName       string  `json:"skuName"`
+					ArmRegionName string  `json:"armRegionName"`
+				} `json:"Items"`
+				NextPageLink string `json:"NextPageLink"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				break
+			}
+
+			// Private Endpoint must match "Private Endpoint" meterName exactly
+			if service == "Private Link" {
+				for _, item := range out.Items {
+					if strings.EqualFold(item.MeterName, "Private Endpoint") &&
+						strings.EqualFold(item.ArmRegionName, region) &&
+						strings.Contains(strings.ToLower(item.UnitOfMeasure), "hour") &&
+						item.RetailPrice > 0 {
+						return item.RetailPrice, item.UnitOfMeasure, true
+					}
+				}
+				urlStr = out.NextPageLink
+				continue
+			}
+
+			for _, item := range out.Items {
+				if item.RetailPrice > 0 {
+					if sku != "" && (item.ArmSkuName == sku || item.SkuName == sku || strings.Contains(item.MeterName, sku)) {
+						return item.RetailPrice, item.UnitOfMeasure, true
+					}
+					if strings.Contains(strings.ToLower(item.UnitOfMeasure), "operation") || strings.Contains(strings.ToLower(item.MeterName), "operation") {
+						return item.RetailPrice, item.UnitOfMeasure, true
+					}
+					if sku == "" {
+						return item.RetailPrice, item.UnitOfMeasure, true
+					}
+				}
+			}
+			urlStr = out.NextPageLink
+		}
+	}
+	return 0, "", false
+}
+
+func guessServiceName(resType string) string {
+	switch {
+	case strings.Contains(resType, "linux_virtual_machine"), strings.Contains(resType, "windows_virtual_machine"), strings.Contains(resType, "node_pool"):
+		return "Virtual Machines"
+	case strings.Contains(resType, "kubernetes_cluster"):
+		return "Kubernetes Service"
+	case strings.Contains(resType, "storage"), strings.Contains(resType, "disk"):
+		return "Storage"
+	default:
+		return ""
+	}
+}
+
+func toString(i interface{}) string {
+	if i == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", i)
 }
